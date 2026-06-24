@@ -25,7 +25,7 @@ BOT_TOKEN  = os.getenv("BOT_TOKEN")
 RENDER_URL = os.getenv("RENDER_URL", "").rstrip("/")
 PORT       = int(os.environ.get("PORT", 8080))
 
-RESULT_BASE  = "https://result.ethernet.edu.et"
+RESULT_BASE = "https://result.ethernet.edu.et/usernamepage"
 API_CANDIDATES = [
     "https://result.ethernet.edu.et/api/student/result",
     "https://result.ethernet.edu.et/api/result",
