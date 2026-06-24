@@ -1,10 +1,9 @@
 import os
 import logging
-import threading
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
-from telegram import Update
+from flask import Flask, request as flask_request, abort
+from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,6 +11,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+import asyncio
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -21,340 +21,285 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.environ.get("PORT", 8080))
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
+RENDER_URL  = os.getenv("RENDER_URL")   # e.g. https://your-app-name.onrender.com
+PORT        = int(os.environ.get("PORT", 8080))
 
-RESULT_URL = "https://result.ethernet.edu.et"
-# The React app calls a JSON API — we target it directly.
-# Pattern observed: POST /api/result  or  GET /api/result?reg=<REG>
-# We try both approaches so the bot degrades gracefully if one changes.
-API_ENDPOINTS = [
+RESULT_BASE = "https://result.ethernet.edu.et"
+
+# These are the known backend API patterns for the MoE React app.
+# The app calls its own backend — we replicate those calls.
+API_CANDIDATES = [
+    "https://result.ethernet.edu.et/api/student/result",
     "https://result.ethernet.edu.et/api/result",
+    "https://result.ethernet.edu.et/api/results",
     "https://result.ethernet.edu.et/result",
 ]
 
-HEADERS = {
+SCRAPE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Referer": RESULT_URL,
-    "Origin": RESULT_URL,
+    "Accept":          "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         RESULT_BASE + "/",
+    "Origin":          RESULT_BASE,
 }
 
-# ─── Flask keep-alive server ───────────────────────────────────────────────────
+# ─── Telegram Application (built once, reused across requests) ─────────────────
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# ─── Flask app ─────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
-@flask_app.route("/")
+@flask_app.route("/", methods=["GET"])
 def home():
-    return "Exit Exam Bot is running ✅", 200
+    return "Exit Exam Bot is live ✅", 200
 
-@flask_app.route("/health")
+@flask_app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok"}, 200
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT)
+@flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    """Receive updates from Telegram and dispatch them."""
+    if flask_request.method != "POST":
+        abort(403)
 
-# ─── Scraping helpers ──────────────────────────────────────────────────────────
+    json_data = flask_request.get_json(force=True)
+    update = Update.de_json(json_data, application.bot)
 
-def fetch_result_json(reg_number: str) -> dict | None:
-    """Try JSON API endpoints (GET and POST)."""
+    # Run the async handler in the event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(application.process_update(update))
+    finally:
+        loop.close()
+
+    return "ok", 200
+
+# ─── Result fetching ───────────────────────────────────────────────────────────
+
+def try_json_api(reg: str) -> dict | None:
+    """Try all known JSON API endpoints with GET and POST."""
     session = requests.Session()
-    session.headers.update(HEADERS)
+    session.headers.update(SCRAPE_HEADERS)
 
-    for endpoint in API_ENDPOINTS:
-        # Try GET
-        try:
-            resp = session.get(endpoint, params={"reg": reg_number, "regno": reg_number}, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data:
-                    return data
-        except Exception:
-            pass
+    payloads = [
+        {"reg": reg},
+        {"regno": reg},
+        {"registrationNumber": reg},
+        {"registration_number": reg},
+        {"id": reg},
+    ]
 
-        # Try POST
-        try:
-            resp = session.post(
-                endpoint,
-                json={"reg": reg_number, "regno": reg_number},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data:
-                    return data
-        except Exception:
-            pass
-
-        # Try POST form-encoded
-        try:
-            resp = session.post(
-                endpoint,
-                data={"reg": reg_number, "regno": reg_number},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
+    for endpoint in API_CANDIDATES:
+        for payload in payloads:
+            # GET
+            try:
+                r = session.get(endpoint, params=payload, timeout=12)
+                if r.status_code == 200:
+                    data = r.json()
                     if data:
-                        return data
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                        return data if isinstance(data, dict) else (data[0] if data else None)
+            except Exception:
+                pass
+
+            # POST JSON
+            try:
+                r = session.post(endpoint, json=payload, timeout=12)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data:
+                        return data if isinstance(data, dict) else (data[0] if data else None)
+            except Exception:
+                pass
+
+            # POST form
+            try:
+                r = session.post(endpoint, data=payload, timeout=12)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        if data:
+                            return data if isinstance(data, dict) else (data[0] if data else None)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     return None
 
 
-def fetch_result_html(reg_number: str) -> dict | None:
-    """
-    Fallback: POST the registration number to the main page and
-    scrape whatever HTML the server returns.
-    """
+def try_html_scrape(reg: str) -> dict | None:
+    """Last resort: POST to the base URL and scrape any HTML returned."""
     session = requests.Session()
-    session.headers.update(HEADERS)
+    session.headers.update(SCRAPE_HEADERS)
 
-    payloads = [
-        {"reg": reg_number},
-        {"regno": reg_number},
-        {"registration_number": reg_number},
-        {"id": reg_number},
-    ]
-
-    for payload in payloads:
+    for payload in [{"reg": reg}, {"regno": reg}, {"registration_number": reg}]:
         try:
-            resp = session.post(RESULT_URL, data=payload, timeout=15)
-            if resp.status_code != 200:
+            r = session.post(RESULT_BASE, data=payload, timeout=12)
+            if r.status_code != 200:
                 continue
+            if "enable JavaScript" in r.text:
+                continue  # Pure SPA, no server-rendered result
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Generic table scrape — works for many MoE-style result pages
+            soup = BeautifulSoup(r.text, "lxml")
             result = {}
-            tables = soup.find_all("table")
-            for table in tables:
-                rows = table.find_all("tr")
-                for row in rows:
-                    cells = row.find_all(["td", "th"])
-                    if len(cells) >= 2:
-                        key = cells[0].get_text(strip=True).lower()
-                        value = cells[1].get_text(strip=True)
-                        if "name" in key:
-                            result["name"] = value
-                        elif "reg" in key or "id" in key:
-                            result["reg"] = value
-                        elif "score" in key or "mark" in key or "result" in key or "grade" in key:
-                            result["score"] = value
-                        elif "status" in key or "pass" in key or "fail" in key:
-                            result["status"] = value
-                        elif "program" in key or "field" in key or "department" in key:
-                            result["program"] = value
-                        elif "university" in key or "institution" in key:
-                            result["institution"] = value
-                        elif "year" in key or "exam" in key:
-                            result["exam_year"] = value
 
-            # Also check definition lists and labeled spans
-            for dt in soup.find_all(["dt", "label", "strong", "b"]):
-                text = dt.get_text(strip=True).lower()
-                sibling = dt.find_next_sibling()
-                if not sibling:
-                    sibling = dt.parent.find_next_sibling()
-                if sibling:
-                    val = sibling.get_text(strip=True)
-                    if "name" in text and "name" not in result:
-                        result["name"] = val
-                    elif ("score" in text or "mark" in text) and "score" not in result:
-                        result["score"] = val
-                    elif "status" in text and "status" not in result:
-                        result["status"] = val
+            for row in soup.find_all("tr"):
+                cells = row.find_all(["td", "th"])
+                if len(cells) >= 2:
+                    k = cells[0].get_text(strip=True).lower()
+                    v = cells[1].get_text(strip=True)
+                    if "name" in k:            result["name"] = v
+                    elif "reg" in k:           result["reg"] = v
+                    elif any(x in k for x in ["score", "mark", "grade"]): result["score"] = v
+                    elif any(x in k for x in ["status", "pass", "fail"]): result["status"] = v
+                    elif any(x in k for x in ["program", "field", "dept"]): result["program"] = v
+                    elif any(x in k for x in ["university", "institution"]): result["institution"] = v
+                    elif "year" in k:          result["exam_year"] = v
 
             if result:
                 return result
-
         except Exception as e:
-            logger.warning(f"HTML scrape attempt failed: {e}")
+            logger.warning(f"HTML scrape failed: {e}")
 
     return None
 
 
-def parse_json_result(data: dict | list) -> dict:
-    """Normalize a JSON API response into a flat result dict."""
-    if isinstance(data, list):
-        data = data[0] if data else {}
-
-    # Common key aliases used by MoE APIs
+def normalize(raw: dict) -> dict:
     aliases = {
-        "name":        ["name", "student_name", "full_name", "studentName", "fullName"],
+        "name":        ["name", "student_name", "full_name", "studentName", "fullName", "Name"],
         "reg":         ["reg", "regno", "registration", "reg_no", "registrationNumber"],
-        "score":       ["score", "total_score", "result", "mark", "totalScore", "totalMark"],
-        "status":      ["status", "pass_fail", "passFail", "exam_status"],
-        "program":     ["program", "field", "department", "stream"],
+        "score":       ["score", "total_score", "totalScore", "mark", "totalMark", "result", "Score"],
+        "status":      ["status", "pass_fail", "passFail", "exam_status", "Status"],
+        "program":     ["program", "field", "department", "stream", "Program"],
         "institution": ["university", "institution", "college", "school"],
         "exam_year":   ["year", "exam_year", "examYear", "academic_year"],
     }
-
-    result = {}
-    lower_data = {k.lower(): v for k, v in data.items()}
+    out = {}
+    lower = {k.lower(): v for k, v in raw.items()}
     for field, keys in aliases.items():
-        for key in keys:
-            if key in data:
-                result[field] = str(data[key])
+        for k in keys:
+            if k in raw:
+                out[field] = str(raw[k])
                 break
-            if key.lower() in lower_data:
-                result[field] = str(lower_data[key.lower()])
+            if k.lower() in lower:
+                out[field] = str(lower[k.lower()])
                 break
-
-    return result
-
-
-def get_student_result(reg_number: str) -> str:
-    """Master function: try JSON API first, fall back to HTML scraping."""
-    reg_number = reg_number.strip()
-
-    # 1. Try JSON API
-    json_data = fetch_result_json(reg_number)
-    if json_data:
-        result = parse_json_result(json_data)
-        if result:
-            return format_result(reg_number, result)
-
-    # 2. Try HTML scraping
-    html_result = fetch_result_html(reg_number)
-    if html_result:
-        return format_result(reg_number, html_result)
-
-    # 3. Not found or site unreachable
-    return (
-        "❌ *Result not found.*\n\n"
-        "Possible reasons:\n"
-        "• The registration number is incorrect\n"
-        "• Results for your exam have not been published yet\n"
-        "• The MoE website is temporarily down\n\n"
-        f"You can also check directly: {RESULT_URL}"
-    )
+    return out
 
 
-def format_result(reg_number: str, result: dict) -> str:
-    """Build a clean Markdown message from a result dict."""
-    # Determine status emoji
-    status_raw = result.get("status", "").lower()
-    if any(w in status_raw for w in ["pass", "passed", "success"]):
-        status_emoji = "✅"
-    elif any(w in status_raw for w in ["fail", "failed", "not"]):
-        status_emoji = "❌"
+def format_result(reg: str, r: dict) -> str:
+    status_raw = r.get("status", "").lower()
+    if any(w in status_raw for w in ["pass", "success"]):
+        s_emoji = "✅"
+    elif any(w in status_raw for w in ["fail", "not"]):
+        s_emoji = "❌"
     else:
-        status_emoji = "📋"
+        s_emoji = "📋"
 
-    lines = ["🎓 *Exit Exam Result*", "─────────────────────"]
-
-    if result.get("name"):
-        lines.append(f"👤 *Name:* {result['name']}")
-
-    lines.append(f"🪪 *Reg. No:* `{result.get('reg', reg_number)}`")
-
-    if result.get("program"):
-        lines.append(f"📚 *Program:* {result['program']}")
-
-    if result.get("institution"):
-        lines.append(f"🏫 *Institution:* {result['institution']}")
-
-    if result.get("exam_year"):
-        lines.append(f"📅 *Exam Year:* {result['exam_year']}")
-
-    if result.get("score"):
-        lines.append(f"📊 *Score:* {result['score']}")
-
-    if result.get("status"):
-        lines.append(f"{status_emoji} *Status:* {result['status']}")
-
-    lines.append("─────────────────────")
-    lines.append(f"🔗 [View on official site]({RESULT_URL})")
-
+    lines = ["🎓 *Exit Exam Result*", "━━━━━━━━━━━━━━━━━━━━━━"]
+    if r.get("name"):        lines.append(f"👤 *Name:* {r['name']}")
+    lines.append(             f"🪪 *Reg No:* `{r.get('reg', reg)}`")
+    if r.get("program"):     lines.append(f"📚 *Program:* {r['program']}")
+    if r.get("institution"): lines.append(f"🏫 *Institution:* {r['institution']}")
+    if r.get("exam_year"):   lines.append(f"📅 *Year:* {r['exam_year']}")
+    if r.get("score"):       lines.append(f"📊 *Score:* {r['score']}")
+    if r.get("status"):      lines.append(f"{s_emoji} *Status:* {r['status']}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔗 [Official site]({RESULT_BASE})")
     return "\n".join(lines)
 
+
+def get_result(reg: str) -> str:
+    raw = try_json_api(reg)
+    if raw:
+        result = normalize(raw)
+        if result:
+            return format_result(reg, result)
+
+    raw = try_html_scrape(reg)
+    if raw:
+        return format_result(reg, raw)
+
+    return (
+        "❌ *Result not found.*\n\n"
+        "Please check:\n"
+        "• Your registration number is correct\n"
+        "• Results for your batch have been published\n"
+        "• The MoE website is currently accessible\n\n"
+        f"🔗 Check directly: {RESULT_BASE}"
+    )
 
 # ─── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to the Exit Exam Result Bot!*\n\n"
-        "Send me your *registration number* and I'll fetch your result from the "
-        "Ministry of Education portal.\n\n"
-        "Example: `ETH/XXXX/XXXX`\n\n"
-        "Just type or paste your registration number below 👇",
+        "Send me your *registration number* and I'll look up your result "
+        "from the Ministry of Education portal.\n\n"
+        "Just type your registration number and send it 👇",
         parse_mode="Markdown",
     )
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ *How to use this bot:*\n\n"
+        "ℹ️ *How to use:*\n\n"
         "1. Type your registration number (e.g. `ETH/1234/2023`)\n"
-        "2. The bot will query the official MoE result portal\n"
-        "3. Your result will be displayed here\n\n"
-        "If you get an error, double-check your registration number "
-        "or try again later — the MoE site may be temporarily busy.",
+        "2. The bot queries the MoE portal\n"
+        "3. Your result is shown here\n\n"
+        "If you get an error, verify your reg number or try again later.",
         parse_mode="Markdown",
     )
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reg_number = update.message.text.strip()
-
-    if not reg_number:
-        await update.message.reply_text("Please send a valid registration number.")
+    reg = update.message.text.strip()
+    if len(reg) < 3:
+        await update.message.reply_text("⚠️ That doesn't look like a valid registration number. Please try again.")
         return
 
-    # Basic sanity check — skip obvious non-reg inputs
-    if len(reg_number) < 3:
-        await update.message.reply_text(
-            "⚠️ That looks too short to be a registration number. Please try again."
-        )
-        return
-
-    await update.message.reply_text("🔍 Fetching your result, please wait...")
-
+    await update.message.reply_text("🔍 Searching for your result, please wait...")
     try:
-        result_text = get_student_result(reg_number)
-        await update.message.reply_text(result_text, parse_mode="Markdown")
+        text = get_result(reg)
+        await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Unhandled error for {reg_number}: {e}")
+        logger.error(f"Error for {reg}: {e}")
         await update.message.reply_text(
-            "⚠️ An unexpected error occurred. Please try again in a moment.\n\n"
-            f"You can also check directly: {RESULT_URL}"
+            f"⚠️ Something went wrong. Try again or check directly: {RESULT_BASE}"
         )
-
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Telegram error: {context.error}")
 
+# ─── Register handlers ─────────────────────────────────────────────────────────
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+application.add_error_handler(error_handler)
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
-
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable is not set.")
-
-    # Start Flask in a background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"Flask keep-alive server started on port {PORT}")
-
-    # Build and run the Telegram bot
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-
-    logger.info("Telegram bot started. Polling...")
-    app.run_polling(drop_pending_updates=True)
-
-
 if __name__ == "__main__":
-    main()
+    import asyncio
+
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN is not set.")
+    if not RENDER_URL:
+        raise ValueError("RENDER_URL is not set. Example: https://your-app.onrender.com")
+
+    # Register the webhook with Telegram
+    async def set_webhook():
+        await application.initialize()
+        webhook_url = f"{RENDER_URL.rstrip('/')}/{BOT_TOKEN}"
+        await application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+
+    asyncio.run(set_webhook())
+
+    # Start Flask (this is the ONLY server — it receives webhook POSTs from Telegram)
+    logger.info(f"Starting Flask on port {PORT}")
+    flask_app.run(host="0.0.0.0", port=PORT)
